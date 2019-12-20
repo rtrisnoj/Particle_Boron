@@ -9,6 +9,7 @@
 
 void setup();
 void loop();
+void initSyncTime();
 void initConnection();
 void disconnectConnection();
 void calculateRainGaugeData();
@@ -30,6 +31,7 @@ int i = 0;
 unsigned long temp = 0;
 int buttonState = 0;
 char payload[128];
+char totalPayload[128];
 
 
 SYSTEM_MODE (MANUAL);
@@ -41,9 +43,10 @@ void setup()
   pinMode(buttonPin, INPUT_PULLUP);
   pinMode(led1, OUTPUT);
   pinMode(led2, OUTPUT);
-  prevMinute = Time.minute();
   digitalWrite(led1, LOW);
   digitalWrite(led2, LOW);
+  initSyncTime();
+  prevMinute = Time.minute();
 }
 void loop()
 {
@@ -77,9 +80,12 @@ void loop()
     {
     //initiliaze connection, Cellular and Particle cloud handshake
     initConnection();
-    
+    strcpy(totalPayload,String(Time.now()-60*sendInterval));
+    strcat(totalPayload,",1001,");
+    strcat(totalPayload,payload);
     //send Message
-    Particle.publish("StatusRainGauge",payload ,PRIVATE);
+    //Particle.publish("StatusRainGauge",payload ,PRIVATE);
+    Particle.publish("Temp", totalPayload, PRIVATE);
     //Particle.publish("Temp", "{ 'id':'1C93F9','data':'ffffffffffffffff30','time':'1570476362','device':'1C93F9','lqi':'Good'}", PRIVATE);
     Serial.println("Message sent");
     strcpy(payload,"");
@@ -109,7 +115,11 @@ void loop()
     //Serial.println("Sleep");
     //publish("warning", "Call setEnabled() to enable deep sleep");
 }
-
+void initSyncTime(){
+  initConnection();
+  Particle.syncTime();
+  Particle.publish("StatusRainGauge",payload ,PRIVATE);
+}
 
 void initConnection()
 {
