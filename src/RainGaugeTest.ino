@@ -1,3 +1,10 @@
+/*  Changelog
+1.1.1- Change pin type from INPUT_PULLDOWN to INPUT to try and block invalid trips
+1.1.2- Added timesync with each status message
+
+
+*/
+String Version = "1.1.2";
 
 
 int led1 = D0; // Instead of writing D0 over and over again, we'll write led1
@@ -8,43 +15,48 @@ int led2 = D7; // Instead of writing D7 over and over again, we'll write led2
 
 const int buttonPin = D4;
 
-int sendInterval = 12; // number of samples collected to transmit
-int  logInterval = 5;  // Set the log interval in minutes 
-int statusInterval = 1440; //  Status message interval in minutes (default to 1 day)
+int sendInterval = 48;        // number of samples collected to transmit
+int  logInterval = 5;        // Set the log interval in minutes 
+int statusInterval = 1440;   //  Status message interval in minutes (default to 1 day)
+int transmitMode = 1 ;       // 0- send logged data at regular send interval, 1= send at logInterval if tripCount > 0
 long int lastStatusMessage = 0;
 long int prevTime;
 long int currentTime;
-int scheduledWakeup = 0;
-int tripCount = 0;         /******* Use descriptive variable names, not 'i' (FOR loops OK)  ***********/
+long int sleepTime;
+int tripCount = 0;         
 int samplesLogged = 0;
-int buttonState = 0;
-char payload[128];
-char totalPayload[128];
+String payload;
+String totalPayload;
+bool booting = true;
+pin_t wakeUpPins[1] = {D4};
+int sendAttempts = 1;   // counter to indicate number of send attempt failures 
+int timeout = 10000;   // length of time to wait for cellular connection (milliseconds)
+bool debug = false;
+
 
 PRODUCT_ID(10618);
-PRODUCT_VERSION(1.0);
+PRODUCT_VERSION(1);
+
 
 SYSTEM_MODE (MANUAL);
 
 void setup()
 { 
-  delay(3000);
   Serial.begin(9600);
-  pinMode(buttonPin, INPUT_PULLUP);
+  delay(3000);
+  pinMode(buttonPin, INPUT);
   pinMode(led1, OUTPUT);
   pinMode(led2, OUTPUT);
   digitalWrite(led1, LOW);
   digitalWrite(led2, LOW);
   initSyncTime();
-  prevTime = Time.now();          /***** Use full Epoch time, not minutes  ******/
-
-  Particle.subscribe(System.deviceID() + "/hook-response/Status", myHandler, MY_DEVICES);
-
+  prevTime = Time.now();         
+  Particle.subscribe(System.deviceID() + "/hook-response/Status", responseHandler, MY_DEVICES);
   Serial.println("Starting");
 }
-void myHandler(const char *event, const char *data) {
-  Serial.println("response received");
+void responseHandler(const char *event, const char *data) {
   parseString(data);
+   responseMessage();
 }
        
 void parseString(String strVars)
@@ -83,10 +95,12 @@ void parseString(String strVars)
       }
     }
   }
+
   setParameter(parameter,value.replace(".",""));
 }
 bool setParameter(String param, String value)
 {
+ 
 if (param == "si")
   {
       Serial.println("Setting sendInterval to: " + value);
@@ -102,6 +116,24 @@ if (param == "si")
       Serial.println("Setting statusInterval to: " + value);
       statusInterval = value.toInt();
   }
+  else if (param == "tm")
+  {
+      Serial.println("Setting transmitMode to: " + value);
+      transmitMode = value.toInt();
+  }
+  else if (param == "to")
+  {
+      Serial.println("Setting timeout to: " + value);
+      timeout = value.toInt();
+      if (timeout < 10000)  // Ensure that an invalid timeout parameter does not disable radio... minimum timeout is 10 seconds
+        timeout = 10000;
+  }
+  else if (param == "db")
+  {
+      Serial.println("Setting debug to: " + value);
+      if(value == "true")
+        debug = true;
+  }
   else
   {
       Serial.println("Unknown parameter- " + param + ":" + value);
@@ -110,102 +142,142 @@ if (param == "si")
   return true;
 }
 
-/****  Every version of code should contain a daily status message and wait for response  ****/
+/****  Every version of code should contain a daily status message  ****/
 void statusMessage()
 {
-  initConnection();
-  String message =  String(Time.now()) + "," + "Status,li:" + (String)logInterval + ",si:" + (String)sendInterval + ",sm:" + (String)statusInterval;
-  Particle.publish("Status", message, PRIVATE);
-  lastStatusMessage = Time.now();
-  delay(10000);
-  disconnectConnection();
+  if (initConnection())
+  {
+        Particle.syncTime();
+    delay(2000);
+    CellularSignal sig = Cellular.RSSI();
+    int rssi = sig.rssi;
+    Serial.println("RSSI: " + (String)rssi);
 
+    String message =  String(Time.now()) + ",Status,";
+    message += "li:" + (String)logInterval + ",si:" + (String)sendInterval + ",sm:" + (String)statusInterval + ",tm:" + (String)transmitMode;
+    message += ",to:" + (String)timeout + ",ver:" + Version ;
+    message +=  ", RSSI: " + (String)rssi;
+    Particle.publish("Status", message, PRIVATE);
+
+    disconnectConnection();
+  }
+  lastStatusMessage = Time.now() + 60;
+}
+
+/****  validate response to status by sending back new parameters  ****/
+void responseMessage()
+{
+  if (initConnection())
+  {
+    String message =  String(Time.now()) + ",Reply,";
+    message += "li:" + (String)logInterval + ",si:" + (String)sendInterval + ",sm:" + (String)statusInterval + ",tm:" + (String)transmitMode;
+    message += ",to:" + (String)timeout;
+    Particle.publish("Counter", message, PRIVATE);
+    disconnectConnection();
+  }
+}
+
+void debugMessage(String message)
+{
+  if (debug) {
+    if (initConnection())
+    {
+
+      Particle.publish("Counter", message, PRIVATE);
+      disconnectConnection();
+    }
+  }
 }
 
 void loop()
 {
   currentTime = Time.now();
-  buttonState = digitalRead(buttonPin);
+  String wakeupFrom = "RTC";
+  SleepResult result = System.sleepResult();
+  boolean sendingStatus = false;
+
+  /*******  Check if wakeup pin has tripped by using wokenUpByRtc...  wokenByPin is unreliable *******/
+  if (!result.wokenUpByRtc() && !booting) {
+    tripCount++;
+    wakeupFrom = "PIN";
+    delay(200);
+  }
+
+  booting = false;
 
   /******* Check if status message is due  *****/
   if (lastStatusMessage + (60 * statusInterval) < Time.now() )
   {
     statusMessage();
+    sendingStatus = true;
   }
 
-  if ((currentTime - prevTime >= (logInterval * 60)) && scheduledWakeup)
+  /*********   Take sample *************/
+  if (currentTime - prevTime >= (logInterval * 60)) 
   {
-
-    strcat(payload,",");
-    strcat(payload,String(tripCount));
-
-    Serial.print("Payload:");
-    Serial.println(payload);
-    Serial.println(prevTime);
-     
+    payload += "," + (String)tripCount;
     samplesLogged++;
-    tripCount = 0;
     prevTime = currentTime;
 
-    if (samplesLogged >= sendInterval)
+    if (((samplesLogged >= (sendInterval * sendAttempts)) || (transmitMode == 1 && tripCount > 0 )) && !sendingStatus)
     {
-      strcpy(totalPayload,String(Time.now()-(60*sendInterval*samplesLogged)));
-      strcat(totalPayload,",1043,");
-      strcat(totalPayload,String(logInterval));
-      strcat(totalPayload,payload);
-      initConnection();
-      Particle.publish("Counter", totalPayload, PRIVATE);
-      Serial.println("totalPayload: " + (String)totalPayload);
-      disconnectConnection();
-      strcpy(payload,"");
-      samplesLogged = 0;
-      scheduledWakeup = 0;
+      if (initConnection())
+      {
+        totalPayload = String(Time.now()-(60*logInterval*(samplesLogged-1)));
+        totalPayload += ",1043,";
+        totalPayload += String(logInterval);
+        totalPayload += payload;
+        Particle.publish("Counter", totalPayload, PRIVATE);
+        Serial.println("totalPayload: " + (String)totalPayload);
+        payload = "";
+        samplesLogged = 0;
+        disconnectConnection();
+      }
+      else
+      {
+        sendAttempts++;
+      }
     }    
-  }
-  else
-  {
-    if (!scheduledWakeup)
-    {
-      disconnectConnection();
-      Serial.println("Sleep");
-      Serial.println("");
-      System.sleep(logInterval * 60);
-      scheduledWakeup = 1;
-    }
-    calculateRainGaugeData();
+    tripCount = 0;
   }
 
+  /********  Good night!  ************/
+      
+     if (wakeupFrom == "PIN")
+     {       // Back to sleep for remainder of normal log interval
+      int sleepRemainder = (logInterval * 60) - (Time.now() - sleepTime);
+      debugMessage("Sleep from Pin Wake: " + (String)sleepRemainder);
+      System.sleep(wakeUpPins,1,FALLING, sleepRemainder);
+     }
+     
+    else
+    {
+      sleepTime = Time.now();
+      debugMessage("Normal sleep");
+      System.sleep(wakeUpPins,1,FALLING,logInterval * 60);
+    }
+    
 }
 void initSyncTime()
 {
   initConnection();
   Particle.syncTime();
 }
-void initConnection()
+bool initConnection()
 {
+  bool retVal = false;
   Cellular.on();
   Cellular.connect();
-  waitUntil(Cellular.ready);
+  waitFor(Cellular.ready,timeout);
   Particle.connect();
-  waitUntil(Particle.connected);
+  waitFor(Particle.connected,timeout);
+  if (Cellular.ready())
+    retVal = true;
+  return retVal;
 }
 void disconnectConnection()
 {
   Particle.disconnect();
   waitUntil(Particle.disconnected);
   Cellular.off();
-}
-void calculateRainGaugeData()
-{
-  if (buttonState == HIGH)
-  {
-  // turn LED on:
-  //Serial.println("HIGH");
-  }
-  else
-  {
-    tripCount++;
-    delay(400);
-    Serial.println(tripCount);
-  }
 }
